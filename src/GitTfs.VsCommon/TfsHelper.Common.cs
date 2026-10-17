@@ -1014,12 +1014,31 @@ namespace GitTfs.VsCommon
 
         public IEnumerable<TfsLabel> GetLabels(string tfsPathBranch, string nameFilter = null)
         {
-            foreach (var labelDefinition in VersionControl.QueryLabels(nameFilter, tfsPathBranch, null, false, null, VersionSpec.Latest))
+            var labelDefinitions = VersionControl.QueryLabels(nameFilter, tfsPathBranch, null, false, null, VersionSpec.Latest);
+            var total = labelDefinitions.Length;
+            Trace.TraceInformation(Colorize(AnsiCyan, "Found " + total + " label(s). Loading label details..."));
+            var loaded = 0;
+            var labels = labelDefinitions
+                .AsParallel()
+                .WithDegreeOfParallelism(GetLabelParallelism())
+                .WithMergeOptions(ParallelMergeOptions.NotBuffered)
+                .Select(labelDefinition =>
+                {
+                    var stopwatch = Stopwatch.StartNew();
+                    var label = VersionControl.QueryLabels(labelDefinition.Name, labelDefinition.Scope, labelDefinition.OwnerName, true, null, VersionSpec.Latest)
+                        .FirstOrDefault(l => l.LabelId == labelDefinition.LabelId);
+                    var current = Interlocked.Increment(ref loaded);
+                    Trace.TraceInformation(Colorize(AnsiGray, "[" + current + "/" + total + "] Loaded label '" + labelDefinition.Name + "' ("
+                        + (label?.Items.Length ?? 0) + " items, " + stopwatch.ElapsedMilliseconds + " ms)"));
+                    return new { labelDefinition.Name, Label = label };
+                });
+
+            foreach (var result in labels)
             {
-                var label = VersionControl.QueryLabels(labelDefinition.Name, tfsPathBranch, null, true, null, VersionSpec.Latest).FirstOrDefault();
+                var label = result.Label;
                 if (label == null)
                 {
-                    throw new GitTfsException("error: data for the label '" + labelDefinition.Name + "' can't be loaded!");
+                    throw new GitTfsException("error: data for the label '" + result.Name + "' can't be loaded!");
                 }
                 var tfsLabel = new TfsLabel
                 {
@@ -1049,10 +1068,33 @@ namespace GitTfs.VsCommon
 
                 if (foundRelevantItems)
                 {
+                    Trace.TraceInformation(Colorize(AnsiGreen, "Label '" + label.Name + "' kept (C" + tfsLabel.ChangesetId
+                        + (tfsLabel.IsTransBranch ? ", also spans other branches" : "") + ")"));
                     yield return tfsLabel;
+                }
+                else
+                {
+                    Trace.TraceInformation(Colorize(AnsiYellow, "Label '" + label.Name + "' skipped (no items under " + tfsPathBranch + ")"));
                 }
             }
         }
+
+        private static int GetLabelParallelism()
+        {
+            var value = Environment.GetEnvironmentVariable("GIT_TFS_LABEL_PARALLELISM");
+            return int.TryParse(value, out var parallelism) && parallelism > 0 ? Math.Min(parallelism, 64) : 16;
+        }
+
+        private const string AnsiGray = "\u001b[90m";
+        private const string AnsiGreen = "\u001b[32m";
+        private const string AnsiYellow = "\u001b[33m";
+        private const string AnsiCyan = "\u001b[36m";
+        private const string AnsiReset = "\u001b[0m";
+
+        private static readonly bool UseAnsiColors = !Console.IsOutputRedirected
+            && (Environment.GetEnvironmentVariable("WT_SESSION") != null || Environment.GetEnvironmentVariable("GIT_TFS_COLOR") == "1");
+
+        private static string Colorize(string color, string message) => UseAnsiColors ? color + message + AnsiReset : message;
 
         public void CreateBranch(string sourcePath, string targetPath, int changesetId, string comment = null)
         {
