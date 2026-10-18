@@ -70,6 +70,7 @@ namespace GitTfs
 
         public const string IgnoreNotInitBranches = GitTfsPrefix + ".ignore-not-init-branches";
         public const string IgnoreBranchesRegex = GitTfsPrefix + ".ignore-branches-regex";
+        public const string MergeAsCherryPick = GitTfsPrefix + ".merge-as-cherry-pick";
 
         public const string BatchSize = GitTfsPrefix + ".batch-size";
         public static string InitialChangeset = GitTfsPrefix + ".initial-changeset";

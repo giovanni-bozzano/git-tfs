@@ -372,7 +372,12 @@ namespace GitTfs.Core
                         renameResult.LastParentCommitBeforeRename = null;
                     }
                     if (parentCommitSha != null)
-                        log.CommitParents.Add(parentCommitSha);
+                    {
+                        if (IsMergeAsCherryPick())
+                            log.Log = log.Log.TrimEnd() + "\n\n(cherry picked from commit " + parentCommitSha + ")\n";
+                        else
+                            log.CommitParents.Add(parentCommitSha);
+                    }
                     if (changeset.Summary.ChangesetId == mergeChangesetId)
                     {
                         foreach (var parent in parentCommitsHashes)
@@ -438,6 +443,12 @@ namespace GitTfs.Core
                 changeset.OmittedParentBranch = ";C" + changeset.Summary.ChangesetId;
             }
             return true;
+        }
+
+        private bool IsMergeAsCherryPick()
+        {
+            var value = Repository.GetConfig<string>(GitTfsConstants.MergeAsCherryPick, null);
+            return value != null && bool.TryParse(value, out var result) && result;
         }
 
         public bool IsIgnoringBranches()

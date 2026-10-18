@@ -159,12 +159,13 @@ namespace GitTfs.VsCommon
             var lastChangeset = lastVersion == -1 ? VersionSpec.Latest : new ChangesetVersionSpec(lastVersion);
             do
             {
-                var startChangeset = new ChangesetVersionSpec(start);
-                changesets = Retry.Do(() => VersionControl.QueryHistory(path, lastChangeset, 0, RecursionType.Full,
-                    null, startChangeset, lastChangeset, BatchCount, true, true, true, true)
-                    .Cast<Changeset>().ToArray());
+                changesets = TakePrefetchedHistory(path, start, lastVersion) ?? QueryHistoryBatch(path, start, lastChangeset);
                 if (changesets.Length > 0)
                     start = changesets[changesets.Length - 1].ChangesetId + 1;
+
+                // Query the next batch in the background while this one is being processed (order of processing is unchanged)
+                if (changesets.Length == BatchCount)
+                    StartHistoryPrefetch(path, start, lastVersion, lastChangeset);
 
                 // don't take the enumerator produced by a foreach statement or a yield statement, as there are references
                 // to the old (iterated) elements and thus the referenced changesets won't be disposed until all elements were iterated.
@@ -174,6 +175,48 @@ namespace GitTfs.VsCommon
                     changesets[i] = null;
                 }
             } while (!byLots && changesets.Length == BatchCount);
+        }
+
+        private Changeset[] QueryHistoryBatch(string path, int start, VersionSpec lastChangeset) =>
+            Retry.Do(() => VersionControl.QueryHistory(path, lastChangeset, 0, RecursionType.Full,
+                null, new ChangesetVersionSpec(start), lastChangeset, BatchCount, true, true, true, true)
+                .Cast<Changeset>().ToArray());
+
+        private readonly object _historyPrefetchLock = new object();
+        private string _historyPrefetchKey;
+        private Task<Changeset[]> _historyPrefetch;
+
+        private static string HistoryPrefetchKey(string path, int start, int lastVersion) => path + "|" + start + "|" + lastVersion;
+
+        private void StartHistoryPrefetch(string path, int start, int lastVersion, VersionSpec lastChangeset)
+        {
+            lock (_historyPrefetchLock)
+            {
+                _historyPrefetchKey = HistoryPrefetchKey(path, start, lastVersion);
+                _historyPrefetch = Task.Run(() => QueryHistoryBatch(path, start, lastChangeset));
+            }
+        }
+
+        private Changeset[] TakePrefetchedHistory(string path, int start, int lastVersion)
+        {
+            Task<Changeset[]> prefetch;
+            lock (_historyPrefetchLock)
+            {
+                if (_historyPrefetch == null || _historyPrefetchKey != HistoryPrefetchKey(path, start, lastVersion))
+                    return null;
+                prefetch = _historyPrefetch;
+                _historyPrefetch = null;
+                _historyPrefetchKey = null;
+            }
+            try
+            {
+                return prefetch.GetAwaiter().GetResult();
+            }
+            catch (Exception ex)
+            {
+                Trace.WriteLine("Prefetched history query failed, querying again: " + ex.Message);
+                return null;
+            }
         }
 
         public virtual int FindMergeChangesetParent(string path, int targetChangeset, GitTfsRemote remote)
