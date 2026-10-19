@@ -35,6 +35,10 @@ namespace GitTfs.Core.TfsInterop
         bool IsExistingInTfs(string path);
         int FindMergeChangesetParent(string path, int firstChangeset, GitTfsRemote remote);
         /// <summary>
+        /// Returns the exact source changesets (by source branch path) merged into <paramref name="path"/> by <paramref name="targetChangeset"/>.
+        /// </summary>
+        IDictionary<string, SortedDictionary<int, bool>> GetMergedSourceChangesets(string path, int targetChangeset);
+        /// <summary>
         /// Creates and maps a workspace for the given remote with the given local -> server directory mappings, at the given Tfs version,
         /// and then performs the action.
         /// </summary>

@@ -224,10 +224,7 @@ namespace GitTfs.VsCommon
             var targetVersion = new ChangesetVersionSpec(targetChangeset);
             var searchTo = targetVersion;
 
-            var changes = VersionControl.GetChangesForChangeset(targetChangeset, false, Int32.MaxValue, null, null, true).Where(change =>
-            {
-                return change.ChangeType.HasFlag(ChangeType.Merge) && change.Item.ServerItem.Contains(path);
-            });
+            var changes = GetMergeChanges(path, targetChangeset);
             if (changes.Empty())
                 return -1;
             //retrieve the highest possible 'source' version
@@ -242,6 +239,74 @@ namespace GitTfs.VsCommon
                     return -1;
                 return mergeSources.Max(mergeSource => mergeSource.VersionTo);
             });
+        }
+
+        public IDictionary<string, SortedDictionary<int, bool>> GetMergedSourceChangesets(string path, int targetChangeset)
+        {
+            var result = new Dictionary<string, SortedDictionary<int, bool>>(StringComparer.OrdinalIgnoreCase);
+            var mergeSourcePaths = GetMergeChanges(path, targetChangeset)
+                .SelectMany(c => c.MergeSources)
+                .Select(s => GetBranchRootOf(s.ServerItem))
+                .Where(p => p != null && !IsSameOrUnder(path, p) && !IsSameOrUnder(p, path))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
+            var target = new ChangesetVersionSpec(targetChangeset);
+            foreach (var sourcePath in mergeSourcePaths)
+            {
+                var merges = Retry.Do(() => VersionControl.QueryMerges(sourcePath, target, path, target, target, target, RecursionType.Full));
+                if (!merges.Any(m => m.TargetVersion == targetChangeset))
+                {
+                    Trace.TraceInformation("info: merge history query for C" + targetChangeset + " from " + sourcePath + " returned nothing; retrying without version filter (slower).");
+                    merges = Retry.Do(() => VersionControl.QueryMerges(sourcePath, target, path, target, new ChangesetVersionSpec(1), target, RecursionType.Full));
+                }
+                var ids = new SortedDictionary<int, bool>();
+                foreach (var m in merges.Where(m => m.TargetVersion == targetChangeset))
+                {
+                    bool partial;
+                    ids.TryGetValue(m.SourceVersion, out partial);
+                    ids[m.SourceVersion] = partial || m.Partial;
+                }
+                if (ids.Count > 0)
+                    result[sourcePath] = ids;
+            }
+            return result;
+        }
+
+        private int _mergeChangesChangesetId;
+        private string _mergeChangesPath;
+        private List<Change> _mergeChanges;
+
+        // FindMergeChangesetParent and GetMergedSourceChangesets are called for the same changeset: query the server only once.
+        private List<Change> GetMergeChanges(string path, int targetChangeset)
+        {
+            if (_mergeChanges != null && _mergeChangesChangesetId == targetChangeset && string.Equals(_mergeChangesPath, path, StringComparison.OrdinalIgnoreCase))
+                return _mergeChanges;
+
+            var changes = VersionControl.GetChangesForChangeset(targetChangeset, false, Int32.MaxValue, null, null, true)
+                .Where(change => change.ChangeType.HasFlag(ChangeType.Merge) && IsSameOrUnder(change.Item.ServerItem, path))
+                .ToList();
+            _mergeChangesChangesetId = targetChangeset;
+            _mergeChangesPath = path;
+            _mergeChanges = changes;
+            return changes;
+        }
+
+        private static bool IsSameOrUnder(string item, string root)
+        {
+            root = root.TrimEnd('/');
+            return item.Equals(root, StringComparison.OrdinalIgnoreCase) || item.StartsWith(root + "/", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private string[] _branchRootsLongestFirst;
+
+        private string GetBranchRootOf(string serverItem)
+        {
+            if (_branchRootsLongestFirst == null)
+                _branchRootsLongestFirst = AllTfsBranchObjects
+                    .Select(b => b.Properties.RootItem.Item)
+                    .OrderByDescending(root => root.Length)
+                    .ToArray();
+            return _branchRootsLongestFirst.FirstOrDefault(root => IsSameOrUnder(serverItem, root));
         }
 
         public IEnumerable<string> GetAllTfsRootBranchesOrderedByCreation() => AllTfsBranchObjects

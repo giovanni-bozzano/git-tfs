@@ -357,6 +357,14 @@ namespace GitTfs.Core
                         fetchResult.IsSuccess = false;
                         return fetchResult;
                     }
+                    IDictionary<string, SortedDictionary<int, bool>> mergeSources = null;
+                    if (parentCommitSha != null && IsMergeAsCherryPick()
+                        && !QueryAndFetchMergeSources(changeset.Summary.ChangesetId, stopOnFailMergeCommit, out mergeSources))
+                    {
+                        fetchResult.NewChangesetCount--;
+                        fetchResult.IsSuccess = false;
+                        return fetchResult;
+                    }
                     var parentSha = (renameResult != null && renameResult.IsProcessingRenameChangeset) ? renameResult.LastParentCommitBeforeRename : MaxCommitHash;
                     var isFirstTFSCommitInRepository = (MaxChangesetId == 0);
                     var log = Apply(parentSha, changeset, objects);
@@ -374,7 +382,7 @@ namespace GitTfs.Core
                     if (parentCommitSha != null)
                     {
                         if (IsMergeAsCherryPick())
-                            log.Log = log.Log.TrimEnd() + "\n\n(cherry picked from commit " + parentCommitSha + ")\n";
+                            log.Log = log.Log.TrimEnd() + "\n\n" + BuildCherryPickLines(mergeSources, parentCommitSha);
                         else
                             log.CommitParents.Add(parentCommitSha);
                     }
@@ -443,6 +451,61 @@ namespace GitTfs.Core
                 changeset.OmittedParentBranch = ";C" + changeset.Summary.ChangesetId;
             }
             return true;
+        }
+
+        private bool QueryAndFetchMergeSources(int targetChangesetId, bool stopOnFailMergeCommit, out IDictionary<string, SortedDictionary<int, bool>> sources)
+        {
+            try
+            {
+                sources = Tfs.GetMergedSourceChangesets(TfsRepositoryPath, targetChangesetId);
+            }
+            catch (Exception ex)
+            {
+                sources = null;
+                var errors = ex is AggregateException aggregate
+                    ? aggregate.Flatten().InnerExceptions
+                    : (IEnumerable<Exception>)new[] { ex };
+                Trace.TraceInformation("warning: unable to query merge sources of C" + targetChangesetId + ": "
+                    + string.Join(" | ", errors.Select(e => e.GetType().Name + ": " + e.Message)));
+                Trace.WriteLine(ex.ToString());
+                return !stopOnFailMergeCommit;
+            }
+
+            // Fetching a source branch up to its highest merged changeset also fetches all the lower ones.
+            foreach (var source in sources)
+            {
+                var maxId = source.Value.Keys.Last();
+                if (Repository.FindCommitHashByChangesetId(maxId) != null)
+                    continue;
+                string omittedParentBranch;
+                if (FindMergedRemoteAndFetch(maxId, stopOnFailMergeCommit, out omittedParentBranch) == null)
+                {
+                    if (stopOnFailMergeCommit)
+                        return false;
+                    Trace.TraceInformation("warning: unable to fetch merge source " + source.Key + ";C" + maxId + ". It will be referenced by changeset id only.");
+                }
+            }
+            return true;
+        }
+
+        private string BuildCherryPickLines(IDictionary<string, SortedDictionary<int, bool>> sources, string fallbackSha)
+        {
+            if (sources == null || sources.Count == 0)
+                return "(cherry picked from commit " + fallbackSha + ")\n";
+
+            var builder = new StringBuilder();
+            foreach (var source in sources)
+            {
+                foreach (var entry in source.Value)
+                {
+                    var prefix = entry.Value ? "(partially cherry picked from " : "(cherry picked from ";
+                    var sha = Repository.FindCommitHashByChangesetId(entry.Key);
+                    builder.Append(sha != null
+                        ? prefix + "commit " + sha + ")\n"
+                        : prefix + source.Key + ";C" + entry.Key + ")\n");
+                }
+            }
+            return builder.ToString();
         }
 
         private bool IsMergeAsCherryPick()

@@ -524,6 +524,12 @@ namespace GitTfs.Core
 
         public string FindCommitHashByChangesetId(int changesetId)
         {
+            string cachedSha;
+            if (changesetsCache.TryGetValue(changesetId, out cachedSha))
+                return cachedSha;
+            if (cacheIsFull)
+                return null;
+
             var commit = FindCommitByChangesetId(changesetId);
             if (commit == null)
                 return null;

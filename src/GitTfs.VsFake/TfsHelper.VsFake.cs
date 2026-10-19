@@ -72,6 +72,8 @@ namespace GitTfs.VsFake
                 .Select(x => BuildTfsChangeset(x, remote));
         }
 
+        public IDictionary<string, SortedDictionary<int, bool>> GetMergedSourceChangesets(string path, int targetChangeset) => new Dictionary<string, SortedDictionary<int, bool>>();
+
         public int FindMergeChangesetParent(string path, int firstChangeset, GitTfsRemote remote)
         {
             var firstChangesetOfBranch = _script.Changesets.FirstOrDefault(c => c.IsMergeChangeset && c.MergeChangesetDatas.MergeIntoBranch == path && c.MergeChangesetDatas.BeforeMergeChangesetId < firstChangeset);
