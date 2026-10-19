@@ -20,6 +20,11 @@ namespace GitTfs
         [STAThread]
         public static void Main(string[] args)
         {
+            if (ConsoleUi.ShouldEnable())
+            {
+                ConsoleUi.Start();
+                Console.CancelKeyPress += (s, e) => ConsoleUi.Stop();
+            }
             try
             {
                 Environment.ExitCode = MainCore(args);
@@ -28,6 +33,10 @@ namespace GitTfs
             {
                 ReportException(e);
                 Environment.ExitCode = GitTfsExitCodes.ExceptionThrown;
+            }
+            finally
+            {
+                ConsoleUi.Stop();
             }
         }
 
@@ -101,7 +110,8 @@ namespace GitTfs
 
                 // Step 2. Create targets and add them to the configuration
                 var consoleTarget = new ColoredConsoleTarget();
-                config.AddTarget("console", consoleTarget);
+                Target uiTarget = ConsoleUi.IsActive ? new ConsoleUiTarget { Layout = @"${message}" } : (Target)consoleTarget;
+                config.AddTarget("console", uiTarget);
 
                 var fileTarget = new FileTarget();
                 config.AddTarget("file", fileTarget);
@@ -118,7 +128,7 @@ namespace GitTfs
                 fileTarget.Layout = "${longdate} [${level}] ${message}";
 
                 // Step 4. Define rules
-                var consoleRule = new LoggingRule("*", LogLevel.Info, consoleTarget);
+                var consoleRule = new LoggingRule("*", LogLevel.Info, uiTarget);
                 config.LoggingRules.Add(consoleRule);
 
                 var fileRule = new LoggingRule("*", LogLevel.Debug, fileTarget);

@@ -25,7 +25,8 @@ namespace GitTfs.Core
         public LogEntry Apply(string lastCommit, IGitTreeModifier treeBuilder, ITfsWorkspace workspace, IDictionary<string, GitObject> initialTree, Action<Exception> ignorableErrorHandler)
         {
             if (initialTree.Empty())
-                Summary.Remote.Repository.GetObjects(lastCommit, initialTree);
+                using (ConsoleUi.Step("Loading git tree of " + (lastCommit ?? "(none)")))
+                    Summary.Remote.Repository.GetObjects(lastCommit, initialTree);
             var remoteRelativeLocalPath = GetPathRelativeToWorkspaceLocalPath(workspace);
             var resolver = new PathResolver(Summary.Remote, remoteRelativeLocalPath, initialTree);
             var sieve = new ChangeSieve(_changeset, resolver);
@@ -55,7 +56,6 @@ namespace GitTfs.Core
                     Delete(change.GitPath, treeBuilder, initialTree);
                     break;
                 case ChangeType.Ignore:
-                    Ignore(change.GitPath);
                     break;
                 default:
                     throw new NotImplementedException("Unsupported change type: " + change.Type);
@@ -74,8 +74,6 @@ namespace GitTfs.Core
                 Trace.TraceInformation("Cannot checkout file '{0}' from TFS. Skip it", change.GitPath);
             }
         }
-
-        private void Ignore(string pathInGitRepo) => Trace.TraceInformation($"C{_changeset.ChangesetId} ! No changes applied to '{pathInGitRepo}', file ignored");
 
         public IEnumerable<TfsTreeEntry> GetTree() => GetFullTree().Where(item => item.Item.ItemType == TfsItemType.File && !Summary.Remote.ShouldSkip(item.FullName));
 
@@ -106,16 +104,21 @@ namespace GitTfs.Core
             var startTime = DateTime.Now;
             var itemsCopied = 0;
             var maxChangesetId = 0;
-            var tfsTreeEntries = GetTree().ToArray();
+            TfsTreeEntry[] tfsTreeEntries;
+            using (ConsoleUi.Step("Listing TFS items of " + Summary.Remote.TfsRepositoryPath + " at C" + _changeset.ChangesetId))
+                tfsTreeEntries = GetTree().ToArray();
             if (tfsTreeEntries.Length == 0)
             {
                 maxChangesetId = _changeset.ChangesetId;
             }
             else
             {
-                workspace.Get(_changeset.ChangesetId, tfsTreeEntries.Select(e => e.Item));
+                using (ConsoleUi.Step(string.Format("Downloading full tree ({0} files)", tfsTreeEntries.Length)))
+                    workspace.Get(_changeset.ChangesetId, tfsTreeEntries.Select(e => e.Item));
+                using (var step = ConsoleUi.Step(string.Format("Hashing files into git objects ({0} files)", tfsTreeEntries.Length)))
                 foreach (var entry in tfsTreeEntries)
                 {
+                    ConsoleUi.Detail(step, string.Format("{0}/{1} {2}", itemsCopied, tfsTreeEntries.Length, entry.FullName));
                     Add(entry.Item, entry.FullName, treeBuilder, workspace);
                     maxChangesetId = Math.Max(maxChangesetId, entry.Item.ChangesetId);
 
@@ -127,7 +130,8 @@ namespace GitTfs.Core
                     }
                 }
             }
-            return MakeNewLogEntry(maxChangesetId == _changeset.ChangesetId ? _changeset : _tfs.GetChangeset(maxChangesetId));
+            using (ConsoleUi.Step("Loading changeset metadata C" + maxChangesetId))
+                return MakeNewLogEntry(maxChangesetId == _changeset.ChangesetId ? _changeset : _tfs.GetChangeset(maxChangesetId));
         }
 
         private void Add(IItem item, string pathInGitRepo, IGitTreeModifier treeBuilder, ITfsWorkspace workspace)

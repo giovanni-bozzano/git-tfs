@@ -1,4 +1,4 @@
-﻿using GitTfs.Core;
+using GitTfs.Core;
 
 namespace GitTfs.VsCommon
 {
@@ -27,16 +27,19 @@ namespace GitTfs.VsCommon
                 catch (Microsoft.TeamFoundation.TeamFoundationServerException ex)
                 {
                     exceptions.Add(ex);
+                    global::GitTfs.Util.ConsoleUi.Retry("attempt " + (retry + 1), ex);
                     Thread.Sleep(retryInterval);
                 }
                 catch (System.Net.WebException ex)
                 {
                     exceptions.Add(ex);
+                    global::GitTfs.Util.ConsoleUi.Retry("attempt " + (retry + 1), ex);
                     Thread.Sleep(retryInterval);
                 }
                 catch (GitTfsException ex) // allows continue of catch (MappingConflictException e) throw as innerexception
                 {
                     exceptions.Add(ex);
+                    global::GitTfs.Util.ConsoleUi.Retry("attempt " + (retry + 1), ex);
                     Thread.Sleep(retryInterval);
                 }
             }

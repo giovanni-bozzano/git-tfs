@@ -43,7 +43,12 @@ namespace GitTfs.Core
         /// <summary>
         /// Runs the given git command, and passes STDOUT through to the current process's STDOUT.
         /// </summary>
-        public void CommandNoisy(params string[] command) => CommandOutputPipe(stdout => Trace.TraceInformation(stdout.ReadToEnd()), command);
+        public void CommandNoisy(params string[] command) => CommandOutputPipe(stdout =>
+        {
+            var output = stdout.ReadToEnd();
+            if (!string.IsNullOrWhiteSpace(output))
+                Trace.TraceInformation(output.TrimEnd());
+        }, command);
 
         /// <summary>
         /// Runs the given git command, and redirects STDOUT to the provided action.

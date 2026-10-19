@@ -1,4 +1,4 @@
-﻿using System.Diagnostics;
+using System.Diagnostics;
 using System.Net;
 using System.Reflection;
 using Microsoft.TeamFoundation.Client;
@@ -183,8 +183,8 @@ namespace GitTfs.VsCommon
                 .Cast<Changeset>().ToArray());
 
         private readonly object _historyPrefetchLock = new object();
-        private string _historyPrefetchKey;
-        private Task<Changeset[]> _historyPrefetch;
+        // One pending prefetch per query: fetching a merge source branch must not discard the prefetch of the branch being fetched.
+        private readonly Dictionary<string, Task<Changeset[]>> _historyPrefetches = new Dictionary<string, Task<Changeset[]>>();
 
         private static string HistoryPrefetchKey(string path, int start, int lastVersion) => path + "|" + start + "|" + lastVersion;
 
@@ -192,8 +192,9 @@ namespace GitTfs.VsCommon
         {
             lock (_historyPrefetchLock)
             {
-                _historyPrefetchKey = HistoryPrefetchKey(path, start, lastVersion);
-                _historyPrefetch = Task.Run(() => QueryHistoryBatch(path, start, lastChangeset));
+                var key = HistoryPrefetchKey(path, start, lastVersion);
+                if (!_historyPrefetches.ContainsKey(key))
+                    _historyPrefetches[key] = Task.Run(() => QueryHistoryBatch(path, start, lastChangeset));
             }
         }
 
@@ -202,11 +203,10 @@ namespace GitTfs.VsCommon
             Task<Changeset[]> prefetch;
             lock (_historyPrefetchLock)
             {
-                if (_historyPrefetch == null || _historyPrefetchKey != HistoryPrefetchKey(path, start, lastVersion))
+                var key = HistoryPrefetchKey(path, start, lastVersion);
+                if (!_historyPrefetches.TryGetValue(key, out prefetch))
                     return null;
-                prefetch = _historyPrefetch;
-                _historyPrefetch = null;
-                _historyPrefetchKey = null;
+                _historyPrefetches.Remove(key);
             }
             try
             {
@@ -219,14 +219,28 @@ namespace GitTfs.VsCommon
             }
         }
 
+        public string LastMergeParentDiagnostic { get; private set; }
+
         public virtual int FindMergeChangesetParent(string path, int targetChangeset, GitTfsRemote remote)
         {
+            LastMergeParentDiagnostic = null;
             var targetVersion = new ChangesetVersionSpec(targetChangeset);
             var searchTo = targetVersion;
 
             var changes = GetMergeChanges(path, targetChangeset);
             if (changes.Empty())
+            {
+                LastMergeParentDiagnostic = "no merge change under " + path + " (merge flag only on items outside the branch path)";
                 return -1;
+            }
+            if (changes.All(c => c.MergeSources == null || !c.MergeSources.Any(s => s.VersionTo < targetChangeset)))
+            {
+                var fromHistory = QueryMergeHistoryOfTarget(path, targetChangeset);
+                if (fromHistory.Count > 0)
+                    return fromHistory.Max(m => m.SourceVersion);
+                LastMergeParentDiagnostic = DescribeUnusableMergeSources(changes, targetChangeset) + "; merge history of the target is empty too";
+                return -1;
+            }
             //retrieve the highest possible 'source' version
             //this version gets use for
             //  1. figuring out where the merge came from (only taking one, as git can only handle 1 anyway).
@@ -269,7 +283,80 @@ namespace GitTfs.VsCommon
                 if (ids.Count > 0)
                     result[sourcePath] = ids;
             }
+            if (result.Count == 0)
+            {
+                // Change.MergeSources can be empty (e.g. old/baseless merges): use the target's merge history instead.
+                foreach (var m in QueryMergeHistoryOfTarget(path, targetChangeset))
+                {
+                    var sourcePath = GetBranchRootOfChangeset(m.SourceVersion, path);
+                    if (sourcePath == null)
+                        continue;
+                    SortedDictionary<int, bool> ids;
+                    if (!result.TryGetValue(sourcePath, out ids))
+                        result[sourcePath] = ids = new SortedDictionary<int, bool>();
+                    bool partial;
+                    ids.TryGetValue(m.SourceVersion, out partial);
+                    ids[m.SourceVersion] = partial || m.Partial;
+                }
+            }
             return result;
+        }
+
+        private string DescribeUnusableMergeSources(List<Change> changes, int targetChangeset)
+        {
+            var withoutSource = changes.Count(c => c.MergeSources == null || !c.MergeSources.Any());
+            var branches = changes
+                .Where(c => c.MergeSources != null)
+                .SelectMany(c => c.MergeSources)
+                .GroupBy(s => GetBranchRootOf(s.ServerItem) ?? s.ServerItem, StringComparer.OrdinalIgnoreCase)
+                .Select(g => g.Key + " C" + g.Min(s => s.VersionFrom) + "-C" + g.Max(s => s.VersionTo)
+                             + (g.All(s => s.VersionTo >= targetChangeset) ? " (not before C" + targetChangeset + ")" : ""))
+                .ToList();
+            return changes.Count + " merged item(s), " + withoutSource + " without source"
+                   + ", source branch(es): " + (branches.Count == 0 ? "none" : string.Join(", ", branches));
+        }
+
+        private int _mergeHistoryChangesetId;
+        private string _mergeHistoryPath;
+        private List<ChangesetMerge> _mergeHistory;
+
+        private List<ChangesetMerge> QueryMergeHistoryOfTarget(string path, int targetChangeset)
+        {
+            if (_mergeHistory != null && _mergeHistoryChangesetId == targetChangeset && string.Equals(_mergeHistoryPath, path, StringComparison.OrdinalIgnoreCase))
+                return _mergeHistory;
+            var target = new ChangesetVersionSpec(targetChangeset);
+            List<ChangesetMerge> merges;
+            try
+            {
+                merges = Retry.Do(() => VersionControl.QueryMerges(null, null, path, target, target, target, RecursionType.Full))
+                    .Where(m => m.TargetVersion == targetChangeset && m.SourceVersion < targetChangeset)
+                    .ToList();
+            }
+            catch (Exception ex)
+            {
+                Trace.WriteLine("Merge history query of " + path + " for C" + targetChangeset + " failed: " + ex.Message);
+                merges = new List<ChangesetMerge>();
+            }
+            _mergeHistoryChangesetId = targetChangeset;
+            _mergeHistoryPath = path;
+            _mergeHistory = merges;
+            return merges;
+        }
+
+        private string GetBranchRootOfChangeset(int changesetId, string targetPath)
+        {
+            try
+            {
+                var changes = VersionControl.GetChangesForChangeset(changesetId, false, 50, null, null, false);
+                return changes
+                    .Select(c => GetBranchRootOf(c.Item.ServerItem))
+                    .FirstOrDefault(p => p != null && !IsSameOrUnder(targetPath, p) && !IsSameOrUnder(p, targetPath));
+            }
+            catch (Exception ex)
+            {
+                Trace.WriteLine("Unable to determine branch of C" + changesetId + ": " + ex.Message);
+                return null;
+            }
         }
 
         private int _mergeChangesChangesetId;

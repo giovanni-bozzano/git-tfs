@@ -35,6 +35,10 @@ namespace GitTfs.Core.TfsInterop
         bool IsExistingInTfs(string path);
         int FindMergeChangesetParent(string path, int firstChangeset, GitTfsRemote remote);
         /// <summary>
+        /// Reason why the last <see cref="FindMergeChangesetParent"/> call could not determine a parent, or null.
+        /// </summary>
+        string LastMergeParentDiagnostic { get; }
+        /// <summary>
         /// Returns the exact source changesets (by source branch path) merged into <paramref name="path"/> by <paramref name="targetChangeset"/>.
         /// </summary>
         IDictionary<string, SortedDictionary<int, bool>> GetMergedSourceChangesets(string path, int targetChangeset);

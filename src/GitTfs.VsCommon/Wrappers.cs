@@ -399,23 +399,54 @@ namespace GitTfs.VsCommon
             }
         }
 
-        public void GetRequests(IEnumerable<GetRequest> source, bool noParallel, int batchSize = 100) => source.ToBatch(batchSize).ForEach(batch =>
-                                                                                                                 {
-                                                                                                                     var items = batch;
-                                                                                                                     Retry.Do(() =>
-                                                                                                                     {
-                                                                                                                         while (items.Length > 0)
-                                                                                                                         {
-                                                                                                                             var status = _workspace.Get(items.ToArray(), GetOptions.Overwrite | GetOptions.GetAll);
-                                                                                                                             if (status.NumFailures == 0)
-                                                                                                                             {
-                                                                                                                                 break;
-                                                                                                                             }
+        public void GetRequests(IEnumerable<GetRequest> source, bool noParallel, int batchSize = 100)
+        {
+            var batches = source.ToBatch(batchSize).ToList();
+            if (batches.Count == 0)
+                return;
+            var totalItems = batches.Sum(b => b.Length);
+            var doneBatches = 0;
+            var doneItems = 0;
+            using (var overall = ConsoleUi.Step(string.Format("TFS get {0} item(s) in {1} batch(es){2}", totalItems, batches.Count, noParallel ? string.Empty : " (parallel)")))
+            {
+                var parent = ConsoleUi.CurrentStep;
+                batches.ForEach(batch =>
+                {
+                    var items = batch;
+                    var attempt = 0;
+                    using (var step = ConsoleUi.Step(string.Format("workspace.Get {0} item(s): {1}", batch.Length, ShortServerPath(batch[0].ItemSpec.Item)), parent))
+                    {
+                        Retry.Do(() =>
+                        {
+                            attempt++;
+                            if (attempt > 1)
+                                ConsoleUi.Detail(step, string.Format("attempt {0}, {1} item(s) remaining", attempt, items.Length));
+                            while (items.Length > 0)
+                            {
+                                var status = _workspace.Get(items.ToArray(), GetOptions.Overwrite | GetOptions.GetAll);
+                                if (status.NumFailures == 0)
+                                    break;
 
-                                                                                                                             items = status.GetFailures().Join(items, e => e.ServerItem, e => e.ItemSpec.Item, (failure, request) => request).ToArray();
-                                                                                                                         }
-                                                                                                                     });
-                                                                                                                 }, !noParallel);
+                                items = status.GetFailures().Join(items, e => e.ServerItem, e => e.ItemSpec.Item, (failure, request) => request).ToArray();
+                                ConsoleUi.Detail(step, string.Format("attempt {0}, {1} failure(s), {2} item(s) remaining", attempt, status.NumFailures, items.Length));
+                                ConsoleUi.Problem(string.Format("workspace.Get reported {0} failure(s), e.g. {1}", status.NumFailures, items.Length > 0 ? items[0].ItemSpec.Item : "?"));
+                            }
+                        });
+                    }
+                    var batchesNow = Interlocked.Increment(ref doneBatches);
+                    var itemsNow = Interlocked.Add(ref doneItems, batch.Length);
+                    ConsoleUi.Detail(overall, string.Format("{0}/{1} batches, {2}/{3} items done", batchesNow, batches.Count, itemsNow, totalItems));
+                }, !noParallel);
+            }
+        }
+
+        private static string ShortServerPath(string path)
+        {
+            if (string.IsNullOrEmpty(path))
+                return path;
+            var parts = path.TrimEnd('/').Split('/');
+            return parts.Length <= 3 ? path : ".../" + string.Join("/", parts.Skip(parts.Length - 3));
+        }
     }
 
     public class WrapperForBranchObject : WrapperFor<BranchObject>, IBranchObject

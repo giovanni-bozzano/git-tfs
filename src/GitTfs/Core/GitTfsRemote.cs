@@ -319,7 +319,9 @@ namespace GitTfs.Core
         public IFetchResult FetchWithMerge(int mergeChangesetId, bool stopOnFailMergeCommit = false, int lastChangesetIdToFetch = -1, IRenameResult renameResult = null, params string[] parentCommitsHashes)
         {
             var fetchResult = new FetchResult { IsSuccess = true, NewChangesetCount = 0 };
-            var latestChangesetId = GetLatestChangesetId();
+            int latestChangesetId;
+            using (ConsoleUi.Step("Querying latest changeset of " + TfsRepositoryPath))
+                latestChangesetId = GetLatestChangesetId();
             if (lastChangesetIdToFetch != -1)
                 latestChangesetId = Math.Min(latestChangesetId, lastChangesetIdToFetch);
             // TFS 2010 doesn't like when we ask for history past its last changeset.
@@ -334,6 +336,7 @@ namespace GitTfs.Core
             bool fetchRetrievedChangesets;
             do
             {
+                ConsoleUi.Detail("querying TFS history from C" + (MaxChangesetId + 1));
                 var fetchedChangesets = FetchChangesets(true, lastChangesetIdToFetch);
 
                 var objects = BuildEntryDictionary();
@@ -348,18 +351,31 @@ namespace GitTfs.Core
                     fetchRetrievedChangesets = true;
 
                     fetchResult.NewChangesetCount++;
+                    ConsoleUi.ChangesetStarted(changeset.Summary.ChangesetId, TfsRepositoryPath);
+                    try
+                    {
                     if (lastChangesetIdToFetch > 0 && changeset.Summary.ChangesetId > lastChangesetIdToFetch)
                         return fetchResult;
                     string parentCommitSha = null;
-                    if (changeset.IsMergeChangeset && !ProcessMergeChangeset(changeset, stopOnFailMergeCommit, ref parentCommitSha))
+                    bool mergeOk = true;
+                    if (changeset.IsMergeChangeset)
+                        using (ConsoleUi.Step("Resolving merge parent"))
+                            mergeOk = ProcessMergeChangeset(changeset, stopOnFailMergeCommit, ref parentCommitSha);
+                    if (!mergeOk)
                     {
                         fetchResult.NewChangesetCount--; // Merge wasn't successful - so don't count the changeset we found
                         fetchResult.IsSuccess = false;
                         return fetchResult;
                     }
                     IDictionary<string, SortedDictionary<int, bool>> mergeSources = null;
-                    if (parentCommitSha != null && IsMergeAsCherryPick()
-                        && !QueryAndFetchMergeSources(changeset.Summary.ChangesetId, stopOnFailMergeCommit, out mergeSources))
+                    bool sourcesOk = true;
+                    if (parentCommitSha != null && IsMergeAsCherryPick())
+                        using (ConsoleUi.Step("Querying merge sources and fetching source branches"))
+                            sourcesOk = QueryAndFetchMergeSources(changeset.Summary.ChangesetId, stopOnFailMergeCommit, out mergeSources);
+                    else if (changeset.IsMergeChangeset)
+                        using (ConsoleUi.Step("Querying merge sources"))
+                            mergeSources = QueryMergeSources(changeset.Summary.ChangesetId);
+                    if (!sourcesOk)
                     {
                         fetchResult.NewChangesetCount--;
                         fetchResult.IsSuccess = false;
@@ -367,7 +383,9 @@ namespace GitTfs.Core
                     }
                     var parentSha = (renameResult != null && renameResult.IsProcessingRenameChangeset) ? renameResult.LastParentCommitBeforeRename : MaxCommitHash;
                     var isFirstTFSCommitInRepository = (MaxChangesetId == 0);
-                    var log = Apply(parentSha, changeset, objects);
+                    LogEntry log;
+                    using (ConsoleUi.Step("Downloading and applying changes"))
+                        log = Apply(parentSha, changeset, objects);
                     if (changeset.IsRenameChangeset && !isFirstTFSCommitInRepository && !firstOnBranch)
                     {
                         if (renameResult == null || !renameResult.IsProcessingRenameChangeset)
@@ -379,20 +397,27 @@ namespace GitTfs.Core
                         renameResult.IsProcessingRenameChangeset = false;
                         renameResult.LastParentCommitBeforeRename = null;
                     }
+                    var mergeLines = new StringBuilder();
                     if (parentCommitSha != null)
                     {
                         if (IsMergeAsCherryPick())
-                            log.Log = log.Log.TrimEnd() + "\n\n" + BuildCherryPickLines(mergeSources, parentCommitSha);
+                            mergeLines.Append(BuildCherryPickLines(mergeSources, parentCommitSha));
                         else
                             log.CommitParents.Add(parentCommitSha);
                     }
+                    mergeLines.Append(BuildTfvcMergeLines(mergeSources));
+                    if (mergeLines.Length > 0)
+                        log.Log = log.Log.TrimEnd() + "\n\n" + mergeLines;
                     if (changeset.Summary.ChangesetId == mergeChangesetId)
                     {
                         foreach (var parent in parentCommitsHashes)
                             log.CommitParents.Add(parent);
                     }
-                    var commitSha = ProcessChangeset(changeset, log);
+                    string commitSha;
+                    using (ConsoleUi.Step("Writing git commit"))
+                        commitSha = ProcessChangeset(changeset, log);
                     fetchResult.LastFetchedChangesetId = changeset.Summary.ChangesetId;
+                    ConsoleUi.ChangesetCompleted(changeset.Summary.ChangesetId, TfsRepositoryPath);
                     // set commit sha for added git objects
                     foreach (var commit in objects)
                     {
@@ -400,6 +425,11 @@ namespace GitTfs.Core
                             commit.Value.Commit = commitSha;
                     }
                     DoGcIfNeeded();
+                    }
+                    finally
+                    {
+                        ConsoleUi.ChangesetEnded(TfsRepositoryPath, false);
+                    }
                 }
             } while (fetchRetrievedChangesets && latestChangesetId > fetchResult.LastFetchedChangesetId);
             return fetchResult;
@@ -413,14 +443,17 @@ namespace GitTfs.Core
             if (!IsIgnoringBranches())
             {
                 var parentChangesetId = Tfs.FindMergeChangesetParent(TfsRepositoryPath, changeset.Summary.ChangesetId, this);
+                var details = parentChangesetId < 1 ? DescribeMergeSources(changeset) : null;
                 if (parentChangesetId < 1)  // Handle missing merge parent info
                 {
                     if (stopOnFailMergeCommit)
                     {
                         return false;
                     }
-                    Trace.TraceInformation("warning: this changeset " + changeset.Summary.ChangesetId +
-                                     " is a merge changeset. But git-tfs is unable to determine the parent changeset.");
+                    var reason = Tfs.LastMergeParentDiagnostic;
+                    var parts = new[] { details, string.IsNullOrEmpty(reason) ? null : "reason: " + reason }.Where(p => !string.IsNullOrEmpty(p)).ToList();
+                    ReportCorrectnessProblem("warning: this changeset " + changeset.Summary.ChangesetId +
+                                     " (branch " + TfsRepositoryPath + ") is a merge changeset. But git-tfs is unable to determine the parent changeset" + (parts.Count == 0 ? "." : ": " + string.Join("; ", parts)));
                     return true;
                 }
                 var shaParent = Repository.FindCommitHashByChangesetId(parentChangesetId);
@@ -439,7 +472,10 @@ namespace GitTfs.Core
                     if (stopOnFailMergeCommit)
                         return false;
 
-                    Trace.TraceInformation("warning: this changeset " + changeset.Summary.ChangesetId +
+                    if (IsIntentionallyOmitted(changeset.OmittedParentBranch))
+                        Trace.WriteLine("C" + changeset.Summary.ChangesetId + ": merge parent C" + parentChangesetId + " is on omitted branch " + changeset.OmittedParentBranch);
+                    else
+                        ReportCorrectnessProblem("warning: this changeset " + changeset.Summary.ChangesetId +
                                      " is a merge changeset. But git-tfs failed to find and fetch the parent changeset "
                                      + parentChangesetId + ". Parent changeset will be ignored...");
                 }
@@ -451,6 +487,43 @@ namespace GitTfs.Core
                 changeset.OmittedParentBranch = ";C" + changeset.Summary.ChangesetId;
             }
             return true;
+        }
+
+        // Branch omitted on purpose (ignore-branches-regex or ignore-not-init-branches): omittedParentBranch is "<branch path>;C<id>".
+        // A value starting with ";" means the branch could not be found.
+        private static bool IsIntentionallyOmitted(string omittedParentBranch) => !string.IsNullOrEmpty(omittedParentBranch) && !omittedParentBranch.StartsWith(";");
+
+        private static readonly object ProblemsLogLock = new object();
+
+        // Problems that can make the converted history differ from TFS: shown in the console, in the UI and in .git\git-tfs-problems.log
+        private void ReportCorrectnessProblem(string message)
+        {
+            Trace.TraceWarning(message);
+            ConsoleUi.Problem(message);
+            try
+            {
+                lock (ProblemsLogLock)
+                    File.AppendAllText(Path.Combine(Repository.GitDir, "git-tfs-problems.log"), DateTime.Now.ToString("s") + " [" + TfsRepositoryPath + "] " + message + Environment.NewLine);
+            }
+            catch (Exception ex)
+            {
+                Trace.WriteLine("Unable to write git-tfs-problems.log: " + ex.Message);
+            }
+        }
+
+        private string DescribeMergeSources(ITfsChangeset changeset)
+        {
+            try
+            {
+                var sources = Tfs.GetMergedSourceChangesets(TfsRepositoryPath, changeset.Summary.ChangesetId);
+                if (sources == null || sources.Count == 0)
+                    return "TFS reports no source branch for this merge";
+                return "source branch(es) " + string.Join(", ", sources.Select(s => s.Key + " (C" + string.Join(",C", s.Value.Keys) + ")"));
+            }
+            catch (Exception ex)
+            {
+                return "source branches could not be queried (" + ex.Message + ")";
+            }
         }
 
         private bool QueryAndFetchMergeSources(int targetChangesetId, bool stopOnFailMergeCommit, out IDictionary<string, SortedDictionary<int, bool>> sources)
@@ -465,7 +538,7 @@ namespace GitTfs.Core
                 var errors = ex is AggregateException aggregate
                     ? aggregate.Flatten().InnerExceptions
                     : (IEnumerable<Exception>)new[] { ex };
-                Trace.TraceInformation("warning: unable to query merge sources of C" + targetChangesetId + ": "
+                ReportCorrectnessProblem("warning: unable to query merge sources of C" + targetChangesetId + ": "
                     + string.Join(" | ", errors.Select(e => e.GetType().Name + ": " + e.Message)));
                 Trace.WriteLine(ex.ToString());
                 return !stopOnFailMergeCommit;
@@ -482,10 +555,43 @@ namespace GitTfs.Core
                 {
                     if (stopOnFailMergeCommit)
                         return false;
-                    Trace.TraceInformation("warning: unable to fetch merge source " + source.Key + ";C" + maxId + ". It will be referenced by changeset id only.");
+                    if (IsIntentionallyOmitted(omittedParentBranch))
+                        Trace.WriteLine("merge source " + source.Key + ";C" + maxId + " is on omitted branch " + omittedParentBranch);
+                    else
+                        ReportCorrectnessProblem("warning: unable to fetch merge source " + source.Key + ";C" + maxId + " (merged into C" + targetChangesetId + "). It will be referenced by changeset id only.");
                 }
             }
             return true;
+        }
+
+        private IDictionary<string, SortedDictionary<int, bool>> QueryMergeSources(int targetChangesetId)
+        {
+            try
+            {
+                return Tfs.GetMergedSourceChangesets(TfsRepositoryPath, targetChangesetId);
+            }
+            catch (Exception ex)
+            {
+                ReportCorrectnessProblem("warning: unable to query merge sources of C" + targetChangesetId + ": " + ex.Message);
+                return null;
+            }
+        }
+
+        // One line per source branch: "git-tfs-tfvc-merge: merged from <branch>;C<first>[:C<last>]", whether or not the source exists in git.
+        private static string BuildTfvcMergeLines(IDictionary<string, SortedDictionary<int, bool>> sources)
+        {
+            if (sources == null)
+                return string.Empty;
+            var builder = new StringBuilder();
+            foreach (var source in sources)
+            {
+                if (source.Value.Count == 0)
+                    continue;
+                var first = source.Value.Keys.First();
+                var last = source.Value.Keys.Last();
+                builder.Append("git-tfs-tfvc-merge: merged from " + source.Key + ";C" + first + (last != first ? ":C" + last : "") + "\n");
+            }
+            return builder.ToString();
         }
 
         private string BuildCherryPickLines(IDictionary<string, SortedDictionary<int, bool>> sources, string fallbackSha)
@@ -500,9 +606,9 @@ namespace GitTfs.Core
                 {
                     var prefix = entry.Value ? "(partially cherry picked from " : "(cherry picked from ";
                     var sha = Repository.FindCommitHashByChangesetId(entry.Key);
-                    builder.Append(sha != null
-                        ? prefix + "commit " + sha + ")\n"
-                        : prefix + source.Key + ";C" + entry.Key + ")\n");
+                    // Sources not in git (filtered, deleted, not fetched) are only recorded by the git-tfs-tfvc-merge lines
+                    if (sha != null)
+                        builder.Append(prefix + "commit " + sha + ")\n");
                 }
             }
             return builder.ToString();
@@ -632,7 +738,7 @@ namespace GitTfs.Core
 
             if (tfsRemote != null && string.Compare(tfsRemote.TfsRepositoryPath, TfsRepositoryPath, StringComparison.InvariantCultureIgnoreCase) != 0)
             {
-                Trace.TraceInformation("\tFetching from dependent TFS remote '{0}'...", tfsRemote.Id);
+                Trace.TraceInformation("Fetching from dependent TFS remote '{0}'...", tfsRemote.Id);
                 try
                 {
                     var fetchResult = ((GitTfsRemote)tfsRemote).FetchWithMerge(-1, stopOnFailMergeCommit, parentChangesetId, renameResult);
@@ -684,14 +790,14 @@ namespace GitTfs.Core
                 if (mergeChangeset && tfsBranch != null && !string.IsNullOrEmpty(filterRegex)
                     && Regex.IsMatch(tfsBranch.Path, filterRegex, RegexOptions.IgnoreCase))
                 {
-                    Trace.TraceInformation("warning: skip filtered branch for path " + tfsBranch.Path + " (regex:" + filterRegex + ")");
+                    Trace.TraceInformation("info: skip filtered branch for path " + tfsBranch.Path + " (regex:" + filterRegex + ")");
                     tfsRemote = null;
                     omittedParentBranch = tfsBranch.Path + ";C" + parentChangesetId;
                 }
                 else if (mergeChangeset && tfsBranch != null &&
                     string.Equals(Repository.GetConfig(GitTfsConstants.IgnoreNotInitBranches), true.ToString(), StringComparison.InvariantCultureIgnoreCase))
                 {
-                    Trace.TraceInformation("warning: skip not initialized branch for path " + tfsBranch.Path);
+                    Trace.TraceInformation("info: skip not initialized branch for path " + tfsBranch.Path);
                     tfsRemote = null;
                     omittedParentBranch = tfsBranch.Path + ";C" + parentChangesetId;
                 }
@@ -778,9 +884,13 @@ namespace GitTfs.Core
 
         private void quickFetch(ITfsChangeset changeset)
         {
-            var log = CopyTree(MaxCommitHash, changeset);
-            UpdateTfsHead(Commit(log), changeset.Summary.ChangesetId);
-            DoGcIfNeeded();
+            using (ConsoleUi.Step("Initial full copy of " + TfsRepositoryPath + " at C" + changeset.Summary.ChangesetId))
+            {
+                var log = CopyTree(MaxCommitHash, changeset);
+                using (ConsoleUi.Step("Writing git commit"))
+                    UpdateTfsHead(Commit(log), changeset.Summary.ChangesetId);
+                DoGcIfNeeded();
+            }
         }
 
         private IEnumerable<ITfsChangeset> FetchChangesets(bool byLots, int lastVersion = -1)
@@ -838,7 +948,7 @@ namespace GitTfs.Core
             LogCurrentMapping();
         }
 
-        private void LogCurrentMapping() => Trace.TraceInformation("C" + MaxChangesetId + " = " + MaxCommitHash);
+        private void LogCurrentMapping() => Trace.TraceInformation("[" + TfsRepositoryPath + "] C" + MaxChangesetId + " = " + MaxCommitHash);
 
         private string TagPrefix => "refs/tags/tfs/" + Id + "/";
 
@@ -846,7 +956,6 @@ namespace GitTfs.Core
 
         private void DoGcIfNeeded()
         {
-            Trace.WriteLine("GC Countdown: " + _globals.GcCountdown);
             if (--_globals.GcCountdown < 0)
             {
                 _globals.GcCountdown = _globals.GcPeriod;
@@ -861,12 +970,16 @@ namespace GitTfs.Core
         private LogEntry Apply(string parent, ITfsChangeset changeset, IDictionary<string, GitObject> entries, Action<Exception> ignorableErrorHandler)
         {
             LogEntry result = null;
+            var setup = ConsoleUi.Step("Preparing TFS workspace");
             WithWorkspace(changeset.Summary, workspace =>
             {
+                setup.Dispose();
                 var treeBuilder = workspace.Remote.Repository.GetTreeBuilder(parent);
                 result = changeset.Apply(parent, treeBuilder, workspace, entries, ignorableErrorHandler);
-                result.Tree = treeBuilder.GetTree();
+                using (ConsoleUi.Step("Building git tree"))
+                    result.Tree = treeBuilder.GetTree();
             });
+            setup.Dispose();
             if (!string.IsNullOrEmpty(parent)) result.CommitParents.Add(parent);
             return result;
         }
@@ -874,12 +987,19 @@ namespace GitTfs.Core
         private LogEntry CopyTree(string lastCommit, ITfsChangeset changeset)
         {
             LogEntry result = null;
+            var setup = ConsoleUi.Step("Preparing TFS workspace");
             WithWorkspace(changeset.Summary, workspace =>
             {
-                var treeBuilder = workspace.Remote.Repository.GetTreeBuilder(lastCommit);
+                setup.Dispose();
+                IGitTreeBuilder treeBuilder;
+                using (ConsoleUi.Step("Creating git tree builder"))
+                    treeBuilder = workspace.Remote.Repository.GetTreeBuilder(lastCommit);
                 result = changeset.CopyTree(treeBuilder, workspace);
-                result.Tree = treeBuilder.GetTree();
+                using (ConsoleUi.Step("Building git tree"))
+                    result.Tree = treeBuilder.GetTree();
+                ConsoleUi.Detail("cleaning up TFS workspace");
             });
+            setup.Dispose();
             if (!string.IsNullOrEmpty(lastCommit)) result.CommitParents.Add(lastCommit);
             return result;
         }
