@@ -17,7 +17,13 @@ namespace GitTfs.Util
         private static readonly TimeSpan VerySlowStep = TimeSpan.FromSeconds(30);
 
         private static readonly object _lock = new object();
-        private static readonly LinkedList<string> _logLines = new LinkedList<string>();
+        private struct LogLine
+        {
+            public string Text;
+            public ConsoleColor Color;
+        }
+
+        private static readonly LinkedList<LogLine> _logLines = new LinkedList<LogLine>();
         private static readonly List<StepScope> _active = new List<StepScope>();
         private static readonly LinkedList<string> _recent = new LinkedList<string>();
         private static readonly Dictionary<string, StepScope> _changesetSteps = new Dictionary<string, StepScope>();
@@ -67,6 +73,7 @@ namespace GitTfs.Util
                 try { Console.OutputEncoding = System.Text.Encoding.UTF8; } catch { }
                 try { Console.CursorVisible = false; } catch { }
                 Console.Clear();
+                _rowCache.Clear();
                 _logDirty = true;
                 _timer = new Timer(_ => Render(), null, 0, 250);
                 new Thread(ReadKeys) { IsBackground = true, Name = "git-tfs console keys" }.Start();
@@ -89,7 +96,11 @@ namespace GitTfs.Util
                     Console.Clear();
                     var height = Math.Max(1, Console.WindowHeight - 3);
                     foreach (var line in _logLines.Skip(Math.Max(0, _logLines.Count - height)))
-                        Console.WriteLine(line);
+                    {
+                        Console.ForegroundColor = line.Color;
+                        Console.WriteLine(line.Text);
+                    }
+                    Console.ResetColor();
                     if (_stepsCompleted > 0)
                         Console.WriteLine(BuildSummary());
                     Console.CursorVisible = true;
@@ -98,7 +109,59 @@ namespace GitTfs.Util
             }
         }
 
-        public static void Log(string message)
+        private static StreamWriter _panelLog;
+        private static bool _panelLogFailed;
+
+        /// <summary>
+        /// Path of the file mirroring the whole top log pane: .git\git-tfs-console.log in the current repository,
+        /// or %LOCALAPPDATA%\git-tfs\git-tfs-console.log when not inside a repository.
+        /// </summary>
+        public static string PanelLogPath
+        {
+            get
+            {
+                var gitDir = Path.Combine(Environment.CurrentDirectory, ".git");
+                if (Directory.Exists(gitDir))
+                    return Path.Combine(gitDir, "git-tfs-console.log");
+                return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "git-tfs", "git-tfs-console.log");
+            }
+        }
+
+        // Called under _lock
+        private static void WriteToPanelLog(string line, ConsoleColor color)
+        {
+            if (_panelLogFailed)
+                return;
+            try
+            {
+                if (_panelLog == null)
+                {
+                    var path = PanelLogPath;
+                    Directory.CreateDirectory(Path.GetDirectoryName(path));
+                    _panelLog = new StreamWriter(new FileStream(path, FileMode.Append, FileAccess.Write, FileShare.ReadWrite), new System.Text.UTF8Encoding(false)) { AutoFlush = true };
+                    _panelLog.WriteLine("==== " + DateTime.Now.ToString("s") + " " + Environment.CommandLine);
+                }
+                _panelLog.WriteLine(DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff") + " " + LevelOf(color) + " " + line);
+            }
+            catch
+            {
+                _panelLogFailed = true;
+            }
+        }
+
+        private static string LevelOf(ConsoleColor color)
+        {
+            switch (color)
+            {
+                case ConsoleColor.Red: return "[ERROR]";
+                case ConsoleColor.Yellow: return "[WARN ]";
+                case ConsoleColor.Cyan: return "[INFO ]";
+                case ConsoleColor.DarkGray: return "[DEBUG]";
+                default: return "[     ]";
+            }
+        }
+
+        public static void Log(string message, ConsoleColor color = ConsoleColor.Gray)
         {
             if (message == null)
                 return;
@@ -106,7 +169,8 @@ namespace GitTfs.Util
             {
                 foreach (var line in message.Replace("\r", string.Empty).Split('\n'))
                 {
-                    _logLines.AddLast(line);
+                    WriteToPanelLog(line, color);
+                    _logLines.AddLast(new LogLine { Text = line, Color = color });
                     if (_logLines.Count > MaxLogLines)
                         _logLines.RemoveFirst();
                     else if (_scrollOffset > 0)
@@ -248,6 +312,7 @@ namespace GitTfs.Util
                     if (width != _lastWidth || height != _lastHeight)
                     {
                         Console.Clear();
+                        _rowCache.Clear();
                         _lastWidth = width;
                         _lastHeight = height;
                         _logDirty = true;
@@ -264,7 +329,7 @@ namespace GitTfs.Util
                         var first = Math.Max(0, _logLines.Count - visible - _scrollOffset);
                         var logs = _logLines.Skip(first).Take(visible).ToList();
                         for (int i = 0; i < visible; i++)
-                            WriteAt(top + i, i < logs.Count ? logs[i] : string.Empty, lineWidth, ConsoleColor.Gray);
+                            WriteAt(top + i, i < logs.Count ? logs[i].Text : string.Empty, lineWidth, i < logs.Count ? logs[i].Color : ConsoleColor.Gray);
                         if (_scrollOffset > 0)
                             WriteAt(top + visible, string.Format(" ↑ scrolled {0} lines up — PgUp/PgDn/↑/↓/Home to scroll, End to follow", _scrollOffset),
                                 lineWidth, ConsoleColor.Black, ConsoleColor.DarkYellow);
@@ -273,10 +338,9 @@ namespace GitTfs.Util
 
                     var row = top + logHeight;
                     var end = top + height - 1;
-                    var process = Process.GetCurrentProcess();
                     WriteAt(row++, new string('─', lineWidth), lineWidth, ConsoleColor.DarkCyan);
                     WriteAt(row++, string.Format(" ● {0} | mem {1} MB | threads {2}", BuildSummary(),
-                        GC.GetTotalMemory(false) / (1024 * 1024), process.Threads.Count), lineWidth, ConsoleColor.Cyan);
+                        GC.GetTotalMemory(false) / (1024 * 1024), ThreadCount()), lineWidth, ConsoleColor.Cyan);
 
                     var activeRows = end - row - MaxRecent - 3;
                     WriteAt(row++, string.Format(" Running ({0}):", _active.Count), lineWidth, ConsoleColor.White);
@@ -375,15 +439,36 @@ namespace GitTfs.Util
             }
         }
 
+        private static readonly Dictionary<int, string> _rowCache = new Dictionary<int, string>();
+        private static int _threadCount;
+        private static DateTime _threadCountTime;
+
+        private static int ThreadCount()
+        {
+            if (DateTime.UtcNow - _threadCountTime > TimeSpan.FromSeconds(5))
+            {
+                using (var process = Process.GetCurrentProcess())
+                    _threadCount = process.Threads.Count;
+                _threadCountTime = DateTime.UtcNow;
+            }
+            return _threadCount;
+        }
+
         private static void WriteAt(int row, string text, int width, ConsoleColor color, ConsoleColor background = ConsoleColor.Black)
         {
             if (row >= Console.BufferHeight)
                 return;
+            text = text ?? string.Empty;
+            text = text.Length > width ? text.Substring(0, width) : text.PadRight(width);
+            var key = (int)color + "|" + (int)background + "|" + text;
+            string previous;
+            if (_rowCache.TryGetValue(row, out previous) && previous == key)
+                return;
+            _rowCache[row] = key;
             Console.SetCursorPosition(0, row);
             Console.ForegroundColor = color;
             Console.BackgroundColor = background;
-            text = text ?? string.Empty;
-            Console.Write(text.Length > width ? text.Substring(0, width) : text.PadRight(width));
+            Console.Write(text);
         }
 
         private static string FormatDuration(TimeSpan duration)

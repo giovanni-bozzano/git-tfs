@@ -127,6 +127,13 @@ namespace GitTfs.Util
         }
 
         private bool? _deletesProject;
+        /// <summary>
+        /// Is the top-level folder deleted (and nothing else happens, so it is not a rename)?
+        /// </summary>
+        public bool DeletesBranchRoot => DeletesProject
+            && NamedChanges.All(c => c.Change.ChangeType.IncludesOneOf(TfsChangeType.Delete)
+                && !c.Change.ChangeType.IncludesOneOf(TfsChangeType.Rename, TfsChangeType.Branch, TfsChangeType.Add, TfsChangeType.Undelete));
+
         private bool DeletesProject
         {
             get

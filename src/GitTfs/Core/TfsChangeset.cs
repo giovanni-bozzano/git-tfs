@@ -30,9 +30,20 @@ namespace GitTfs.Core
             var remoteRelativeLocalPath = GetPathRelativeToWorkspaceLocalPath(workspace);
             var resolver = new PathResolver(Summary.Remote, remoteRelativeLocalPath, initialTree);
             var sieve = new ChangeSieve(_changeset, resolver);
-            if (sieve.RenameBranchCommmit)
+            IsBranchRootDeleted = sieve.DeletesBranchRoot && (IsBranchRecreatedLater?.Invoke(_changeset.ChangesetId) ?? false);
+            if (sieve.RenameBranchCommmit && !IsBranchRootDeleted)
             {
                 IsRenameChangeset = true;
+            }
+            if (IsBranchRootDeleted)
+            {
+                // The branch folder was deleted: mirror it with an empty tree so that a later
+                // recreation of the branch (same path) is applied as a fresh set of additions.
+                foreach (var entry in initialTree.Values.Where(e => !string.IsNullOrEmpty(e.Path)).ToList())
+                    treeBuilder.Remove(entry.Path);
+                initialTree.Clear();
+                Trace.TraceInformation("info: Branch root " + Summary.Remote.TfsRepositoryPath + " deleted in C" + _changeset.ChangesetId + "; continuing (it may be recreated later)");
+                return MakeNewLogEntry();
             }
             _changeset.Get(workspace, sieve.GetChangesToFetch(), ignorableErrorHandler);
             foreach (var change in sieve.GetChangesToApply())
@@ -237,5 +248,7 @@ namespace GitTfs.Core
 
         public string OmittedParentBranch { get; set; }
         public bool IsRenameChangeset { get; set; }
+        public bool IsBranchRootDeleted { get; set; }
+        public Func<int, bool> IsBranchRecreatedLater { get; set; }
     }
 }

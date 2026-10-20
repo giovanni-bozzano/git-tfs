@@ -345,7 +345,62 @@ namespace GitTfs.VsCommon
             DoUntilNoFailures(() => _workspace.Get(new GetRequest(item, changeset), GetOptions.Overwrite | GetOptions.GetAll));
         }
 
-        public void GetSpecificVersion(int changeset) => Retry.Do(() => DoUntilNoFailures(() => _workspace.Get(new ChangesetVersionSpec(changeset), GetOptions.Overwrite | GetOptions.GetAll)));
+        public void GetSpecificVersion(int changeset)
+        {
+            using (var step = ConsoleUi.Step(string.Format("TFS get full tree at C{0} (single request, no batches)", changeset)))
+            {
+                var attempt = 0;
+                var items = 0;
+                var errors = 0;
+                var lastItem = string.Empty;
+                var lastError = string.Empty;
+                var lastActivity = DateTime.UtcNow;
+                var vcs = _workspace.VersionControlServer;
+                GettingEventHandler onGetting = (s, e) =>
+                {
+                    Interlocked.Increment(ref items);
+                    lastItem = e.ServerItem;
+                    lastActivity = DateTime.UtcNow;
+                };
+                ExceptionEventHandler onError = (s, e) =>
+                {
+                    Interlocked.Increment(ref errors);
+                    lastError = (e.Exception != null ? e.Exception.Message : e.Failure != null ? e.Failure.Message : "?");
+                    lastActivity = DateTime.UtcNow;
+                };
+                using (new System.Threading.Timer(_ =>
+                {
+                    var idle = DateTime.UtcNow - lastActivity;
+                    ConsoleUi.Detail(step, string.Format("attempt {0}, {1} item(s) received, {2} error(s){3}{4} \u2014 {5}",
+                        attempt, items, errors,
+                        string.IsNullOrEmpty(lastError) ? string.Empty : " (last: " + lastError + ")",
+                        idle.TotalSeconds >= 30 ? string.Format(", NO PROGRESS for {0:0}s", idle.TotalSeconds) : string.Empty,
+                        ShortServerPath(lastItem)));
+                }, null, 1000, 1000))
+                {
+                    vcs.Getting += onGetting;
+                    vcs.NonFatalError += onError;
+                    try
+                    {
+                        Retry.Do(() => DoUntilNoFailures(() =>
+                        {
+                            attempt++;
+                            items = 0;
+                            lastActivity = DateTime.UtcNow;
+                            var status = _workspace.Get(new ChangesetVersionSpec(changeset), GetOptions.Overwrite | GetOptions.GetAll);
+                            if (status.NumFailures != 0)
+                                ConsoleUi.Problem(string.Format("full get at C{0} reported {1} failure(s) on attempt {2}; retrying the whole tree", changeset, status.NumFailures, attempt));
+                            return status;
+                        }));
+                    }
+                    finally
+                    {
+                        vcs.Getting -= onGetting;
+                        vcs.NonFatalError -= onError;
+                    }
+                }
+            }
+        }
 
         public void GetSpecificVersion(int changesetId, IEnumerable<IItem> items, bool noParallel)
         {
