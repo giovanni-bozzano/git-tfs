@@ -318,6 +318,12 @@ namespace GitTfs.Core
 
         public IFetchResult FetchWithMerge(int mergeChangesetId, bool stopOnFailMergeCommit = false, int lastChangesetIdToFetch = -1, IRenameResult renameResult = null, params string[] parentCommitsHashes)
         {
+            using (ConsoleUi.FetchLevel())
+                return FetchWithMergeCore(mergeChangesetId, stopOnFailMergeCommit, lastChangesetIdToFetch, renameResult, parentCommitsHashes);
+        }
+
+        private IFetchResult FetchWithMergeCore(int mergeChangesetId, bool stopOnFailMergeCommit, int lastChangesetIdToFetch, IRenameResult renameResult, string[] parentCommitsHashes)
+        {
             var fetchResult = new FetchResult { IsSuccess = true, NewChangesetCount = 0 };
             int latestChangesetId;
             using (ConsoleUi.Step("Querying latest changeset of " + TfsRepositoryPath))

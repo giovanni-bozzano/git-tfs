@@ -161,14 +161,54 @@ namespace GitTfs.Util
             }
         }
 
+        [ThreadStatic]
+        private static int _fetchDepth;
+
+        private static string FetchIndent => IndentFor(_fetchDepth);
+
+        private static string IndentFor(int fetchLevel)
+        {
+            if (fetchLevel <= 1)
+                return string.Empty;
+            var builder = new System.Text.StringBuilder();
+            for (var i = 1; i < fetchLevel; i++)
+                builder.Append("│ ");
+            return builder.ToString();
+        }
+
+        /// <summary>
+        /// Marks a (possibly nested) branch fetch on the current thread; log lines written while a nested fetch
+        /// runs are indented one level per nesting, so fetches of merged source branches stand out from the outer one.
+        /// </summary>
+        public static IDisposable FetchLevel()
+        {
+            _fetchDepth++;
+            return new FetchLevelScope();
+        }
+
+        private sealed class FetchLevelScope : IDisposable
+        {
+            private bool _disposed;
+
+            public void Dispose()
+            {
+                if (_disposed)
+                    return;
+                _disposed = true;
+                _fetchDepth--;
+            }
+        }
+
         public static void Log(string message, ConsoleColor color = ConsoleColor.Gray)
         {
             if (message == null)
                 return;
             lock (_lock)
             {
-                foreach (var line in message.Replace("\r", string.Empty).Split('\n'))
+                var indent = FetchIndent;
+                foreach (var rawLine in message.Replace("\r", string.Empty).Split('\n'))
                 {
+                    var line = indent + rawLine;
                     WriteToPanelLog(line, color);
                     _logLines.AddLast(new LogLine { Text = line, Color = color });
                     if (_logLines.Count > MaxLogLines)
@@ -283,7 +323,7 @@ namespace GitTfs.Util
                     return;
                 _stepsCompleted++;
                 var duration = scope.Elapsed;
-                _recent.AddFirst(string.Format("{0,8} {1}{2}", FormatDuration(duration), scope.Description,
+                _recent.AddFirst(string.Format("{0}{1,8} {2}{3}", IndentFor(scope.FetchLevel), FormatDuration(duration), scope.Description,
                     string.IsNullOrEmpty(scope.Detail) ? string.Empty : " (" + scope.Detail + ")"));
                 while (_recent.Count > MaxRecent)
                     _recent.RemoveLast();
@@ -318,7 +358,15 @@ namespace GitTfs.Util
                         _logDirty = true;
                     }
                     var lineWidth = width - 1;
-                    var logHeight = Math.Max(1, height - StatusHeight);
+                    var ordered = OrderAsTree();
+                    var recent = _recent.ToList();
+                    var maxActiveRows = Math.Max(1, StatusHeight - 4 - MaxRecent);
+                    var activeRows = maxActiveRows;
+                    // separator + summary + "Running" + steps + "Recently completed" + recent, down to the last console row
+                    var statusRows = 4 + activeRows + MaxRecent;
+                    var logHeight = Math.Max(1, height - statusRows);
+                    if (logHeight != _logHeight)
+                        _logDirty = true;
                     var top = Console.WindowTop;
 
                     if (_logDirty)
@@ -337,19 +385,16 @@ namespace GitTfs.Util
                     }
 
                     var row = top + logHeight;
-                    var end = top + height - 1;
                     WriteAt(row++, new string('─', lineWidth), lineWidth, ConsoleColor.DarkCyan);
-                    WriteAt(row++, string.Format(" ● {0} | mem {1} MB | threads {2}", BuildSummary(),
+                    WriteAt(row++, string.Format("● {0} | mem {1} MB | threads {2}", BuildSummary(),
                         GC.GetTotalMemory(false) / (1024 * 1024), ThreadCount()), lineWidth, ConsoleColor.Cyan);
 
-                    var activeRows = end - row - MaxRecent - 3;
-                    WriteAt(row++, string.Format(" Running ({0}):", _active.Count), lineWidth, ConsoleColor.White);
-                    var ordered = OrderAsTree();
+                    WriteAt(row++, string.Format("Running ({0}):", _active.Count), lineWidth, ConsoleColor.White);
                     for (int i = 0; i < activeRows; i++)
                     {
                         if (i == activeRows - 1 && ordered.Count > activeRows)
                         {
-                            WriteAt(row++, string.Format("   … and {0} more", ordered.Count - i), lineWidth, ConsoleColor.DarkGray);
+                            WriteAt(row++, string.Format("… and {0} more", ordered.Count - i), lineWidth, ConsoleColor.DarkGray);
                             continue;
                         }
                         if (i >= ordered.Count)
@@ -358,18 +403,20 @@ namespace GitTfs.Util
                             continue;
                         }
                         var step = ordered[i];
-                        var text = string.Format("   {0}{1} {2,8}  {3}{4}{5}",
-                            new string(' ', step.Depth * 2), step.Depth == 0 ? "▶" : "└",
+                        var localDepth = 0;
+                        for (var p = step.Parent; p != null && p.FetchLevel == step.FetchLevel; p = p.Parent)
+                            localDepth++;
+                        var text = string.Format("{0}{1}{2} {3,8}  {4}{5}{6}",
+                            IndentFor(step.FetchLevel), new string(' ', localDepth * 2), localDepth == 0 ? "▶" : "└",
                             FormatDuration(step.Elapsed), step.Description,
                             string.IsNullOrEmpty(step.Detail) ? string.Empty : " — " + step.Detail,
                             step.ThreadId != ordered[0].ThreadId ? " [T" + step.ThreadId + "]" : string.Empty);
                         WriteAt(row++, text, lineWidth, ColorFor(step.Elapsed, ConsoleColor.Green));
                     }
 
-                    WriteAt(row++, " Recently completed:", lineWidth, ConsoleColor.White);
-                    var recent = _recent.ToList();
-                    for (int i = 0; i <= MaxRecent; i++)
-                        WriteAt(row++, i < recent.Count ? "   ✓ " + recent[i] : string.Empty, lineWidth, ConsoleColor.DarkGray);
+                    WriteAt(row++, "Recently completed:", lineWidth, ConsoleColor.White);
+                    for (int i = 0; i < MaxRecent; i++)
+                        WriteAt(row++, i < recent.Count ? "✓ " + recent[i] : string.Empty, lineWidth, ConsoleColor.DarkGray);
                     Console.ResetColor();
                 }
                 catch
@@ -490,7 +537,10 @@ namespace GitTfs.Util
                 Description = description;
                 Parent = parent;
                 ThreadId = Thread.CurrentThread.ManagedThreadId;
+                FetchLevel = Math.Max(_fetchDepth, parent?.FetchLevel ?? 0);
             }
+
+            public int FetchLevel { get; }
 
             public long Id { get; }
             public string Description { get; }
